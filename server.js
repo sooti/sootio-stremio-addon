@@ -34,10 +34,10 @@ import { obfuscateSensitive } from './lib/common/torrent-utils.js';
 import { getManifest } from './lib/util/manifest.js';
 import landingTemplate from './lib/util/landingTemplate.js';
 import donationAdminTemplate from './lib/util/donationAdminTemplate.js';
-import { addDonationRecord, deleteDonationRecord, getDonationAdminStatus, getDonationStatus, processPayPalIpn, updateDonationRecord } from './lib/util/donationTracker.js';
+import { addDonationRecord, deleteDonationRecord, getDonationAdminStatus, getDonationSettings, getDonationStatus, processPayPalIpn, updateDonationRecord, updateDonationSettings } from './lib/util/donationTracker.js';
+import { trackImpression, trackClick, getAbTestStats, updateWeights } from './lib/util/abTestTracker.js';
 import fetch from 'node-fetch';
-import { rewriteNetflixMirrorPlaylist, detectNetflixMirrorPayloadType, stripNetflixMirrorSegmentSuffix } from './lib/http-streams/providers/netflixmirror/proxy.js';
-import { getNetflixMirrorProxyHeaders } from './lib/http-streams/providers/netflixmirror/search.js';
+import debridProxyManager from './lib/util/debrid-proxy.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -479,9 +479,9 @@ app.use((req, res, next) => {
 app.get('/', (req, res) => {
     res.redirect('/configure');
 });
-app.get('/configure', (req, res) => {
+app.get('/configure', async (req, res) => {
     const manifest = getManifest({}, true);
-    res.send(landingTemplate(manifest, {}));  // Pass an empty config object to avoid undefined error
+    res.send(await landingTemplate(manifest, {}));
 });
 
 app.get('/manifest-no-catalogs.json', (req, res) => {
@@ -649,6 +649,20 @@ app.post('/donations/admin/delete', express.json(), express.urlencoded({ extende
     }
 });
 
+app.post('/donations/admin/settings', express.json(), async (req, res) => {
+    if (!ensureDonationsAdminAuthorized(req, res)) return;
+    try {
+        const result = await updateDonationSettings(req.body || {});
+        if (!result?.updated) {
+            return res.status(400).json({ ok: false, reason: result?.reason || 'not_updated' });
+        }
+        res.json({ ok: true, settings: result.settings });
+    } catch (error) {
+        console.error('[DONATIONS] Failed to update settings:', error.message);
+        res.status(500).json({ ok: false, err: 'Failed to update settings' });
+    }
+});
+
 app.post('/paypal/ipn', express.urlencoded({ extended: false }), async (req, res) => {
     try {
         const result = await processPayPalIpn(req.body || {});
@@ -659,6 +673,47 @@ app.post('/paypal/ipn', express.urlencoded({ extended: false }), async (req, res
     } catch (error) {
         console.error('[DONATIONS] PayPal IPN processing failed:', error.message);
         res.status(500).send('IPN processing failed');
+    }
+});
+
+// --- A/B Test Tracking ---
+
+app.post('/ab/track', express.json(), async (req, res) => {
+    try {
+        const { variant, event } = req.body || {};
+        if (!variant || !event) return res.status(400).json({ ok: false });
+        if (event === 'impression') await trackImpression(variant);
+        else if (event === 'click') await trackClick(variant);
+        res.json({ ok: true });
+    } catch (error) {
+        res.status(500).json({ ok: false });
+    }
+});
+
+app.get('/ab/stats', async (req, res) => {
+    if (!ensureDonationsAdminAuthorized(req, res)) return;
+    try {
+        const stats = await getAbTestStats();
+        res.json(stats);
+    } catch (error) {
+        console.error('[AB-TEST] Failed to get stats:', error.message);
+        res.status(500).json({ ok: false, err: 'Failed to load A/B stats' });
+    }
+});
+
+app.post('/ab/weights', express.json(), async (req, res) => {
+    if (!ensureDonationsAdminAuthorized(req, res)) return;
+    try {
+        const weights = req.body?.weights;
+        if (!weights || typeof weights !== 'object') {
+            return res.status(400).json({ ok: false, err: 'Missing weights object' });
+        }
+        await updateWeights(weights);
+        const stats = await getAbTestStats();
+        res.json({ ok: true, stats });
+    } catch (error) {
+        console.error('[AB-TEST] Failed to update weights:', error.message);
+        res.status(500).json({ ok: false, err: 'Failed to update weights' });
     }
 });
 
@@ -1059,9 +1114,6 @@ app.get('/resolve/:debridProvider/:debridApiKey/:url', resolveRateLimiter, async
 app.get('/resolve/httpstreaming/:url', resolveRateLimiter, async (req, res) => {
     const { url } = req.params;
     const decodedUrl = decodeURIComponent(url);
-    if ((req.query.provider || '').toLowerCase() === 'netflixmirror') {
-        return proxyNetflixMirrorStream(decodedUrl, req, res);
-    }
     const isUHDMoviesUrl = decodedUrl.includes('driveleech') ||
         decodedUrl.includes('driveseed') ||
         decodedUrl.includes('tech.unblockedgames.world') ||
@@ -1206,159 +1258,6 @@ app.get('/resolve/httpstreaming/:url', resolveRateLimiter, async (req, res) => {
         res.status(500).send("Error resolving HTTP stream.");
     }
 });
-
-async function proxyNetflixMirrorStream(decodedUrl, req, res) {
-    const targetUrl = stripNetflixMirrorSegmentSuffix(decodedUrl);
-
-    try {
-        const baseHeaders = await getNetflixMirrorProxyHeaders();
-        const headers = {
-            ...baseHeaders,
-            'Accept-Encoding': 'identity'
-        };
-
-        // Preserve the upstream HLS referer chain for nested playlist/segment requests.
-        // The player hits our local /resolve/httpstreaming proxy URLs, so decode that referer
-        // back to the original upstream playlist URL and forward it to NetflixMirror/CDN.
-        const requestReferer = req.get('referer') || req.headers.referer || '';
-        if (requestReferer) {
-            try {
-                const refererUrl = new URL(requestReferer, `${req.protocol}://${req.get('host')}`);
-                const marker = '/resolve/httpstreaming/';
-                const markerIndex = refererUrl.pathname.indexOf(marker);
-                if (markerIndex !== -1) {
-                    let encodedRefererTarget = refererUrl.pathname.slice(markerIndex + marker.length);
-                    encodedRefererTarget = stripNetflixMirrorSegmentSuffix(encodedRefererTarget);
-                    const upstreamReferer = decodeURIComponent(encodedRefererTarget);
-                    if (upstreamReferer.startsWith('http')) {
-                        headers.Referer = upstreamReferer;
-                        try {
-                            headers.Origin = new URL(upstreamReferer).origin;
-                        } catch {
-                            // Ignore malformed referer-derived origin
-                        }
-                    }
-                }
-            } catch {
-                // Keep default NetflixMirror headers if local referer cannot be parsed
-            }
-        }
-
-        if (!headers.Origin) {
-            try {
-                headers.Origin = new URL(targetUrl).origin;
-            } catch {
-                // Ignore invalid target origin
-            }
-        }
-
-        if (req.headers.range) {
-            headers.Range = req.headers.range;
-        }
-
-        Object.keys(headers).forEach(key => {
-            if (headers[key] == null || headers[key] === '') {
-                delete headers[key];
-            }
-        });
-
-        const upstream = await fetch(targetUrl, { headers, redirect: 'follow' });
-        const contentType = upstream.headers.get('content-type') || '';
-
-        if (!upstream.ok) {
-            console.error(`[HTTP-RESOLVER] NetflixMirror upstream error ${upstream.status} for ${targetUrl}`);
-            res.status(upstream.status).send('Failed to fetch NetflixMirror resource');
-            return;
-        }
-
-        const isPlaylist = contentType.includes('mpegurl') || targetUrl.toLowerCase().endsWith('.m3u8');
-
-        if (isPlaylist) {
-            const playlistText = await upstream.text();
-            const resolverProto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').split(',')[0].trim();
-            const resolverBase = `${resolverProto}://${req.get('host')}`;
-            if (!playlistText.includes('#EXTM3U')) {
-                console.error(`[HTTP-RESOLVER] NetflixMirror playlist missing #EXTM3U, body starts: ${playlistText.substring(0, 120)}`);
-                res.status(502).send('Invalid playlist from NetflixMirror');
-                return;
-            }
-            const rewritten = rewriteNetflixMirrorPlaylist(playlistText, targetUrl, resolverBase);
-            res.set('Content-Type', 'application/vnd.apple.mpegurl');
-            res.set('Cache-Control', 'no-store');
-            res.send(rewritten);
-            return;
-        }
-
-        const contentLength = upstream.headers.get('content-length');
-        const contentRange = upstream.headers.get('content-range');
-        const acceptRanges = upstream.headers.get('accept-ranges');
-        const reader = upstream.body?.getReader ? upstream.body.getReader() : null;
-
-        if (!reader) {
-            const buffer = Buffer.from(await upstream.arrayBuffer());
-            const finalType = detectNetflixMirrorPayloadType(buffer, contentType || 'application/octet-stream');
-
-            res.status(upstream.status);
-            res.set('Content-Type', finalType || 'application/octet-stream');
-            if (contentLength) res.set('Content-Length', contentLength);
-            if (contentRange) res.set('Content-Range', contentRange);
-            if (acceptRanges) res.set('Accept-Ranges', acceptRanges);
-            res.set('Cache-Control', 'no-store');
-            res.send(buffer);
-            return;
-        }
-
-        const sniffChunks = [];
-        let done = false;
-        while (!done && Buffer.concat(sniffChunks).length < 400) {
-            const { done: isDone, value } = await reader.read();
-            if (isDone) {
-                done = true;
-                break;
-            }
-            sniffChunks.push(Buffer.from(value));
-        }
-        const sniffBuffer = Buffer.concat(sniffChunks);
-        const finalType = detectNetflixMirrorPayloadType(sniffBuffer, contentType || 'application/octet-stream');
-
-        res.status(upstream.status);
-        res.set('Content-Type', finalType || 'application/octet-stream');
-        if (contentLength) res.set('Content-Length', contentLength);
-        if (contentRange) res.set('Content-Range', contentRange);
-        if (acceptRanges) res.set('Accept-Ranges', acceptRanges);
-        res.set('Cache-Control', 'no-store');
-
-        if (sniffBuffer.length > 0) {
-            res.write(sniffBuffer);
-        }
-
-        if (done) {
-            res.end();
-            return;
-        }
-
-        const pump = async () => {
-            while (true) {
-                const { done: isDone, value } = await reader.read();
-                if (isDone) break;
-                res.write(Buffer.from(value));
-            }
-            res.end();
-        };
-
-        pump().catch(err => {
-            console.error(`[HTTP-RESOLVER] NetflixMirror stream pump failed: ${err.message}`);
-            if (!res.headersSent) {
-                res.status(502).send('Failed to proxy NetflixMirror stream');
-            } else {
-                res.destroy(err);
-            }
-        });
-    } catch (error) {
-        console.error(`[HTTP-RESOLVER] NetflixMirror proxy failed: ${error.message}`);
-        res.status(502).send('Failed to proxy NetflixMirror stream');
-    }
-}
 
 // Middleware to check admin token
 function checkAdminAuth(req, res, next) {
