@@ -261,11 +261,11 @@ router.post('/paypal/ipn', async (req, res) => {
     }
 })
 
-router.get('/:configuration?/configure', (req, res) => {
+router.get('/:configuration?/configure', async (req, res) => {
     const config = parseConfiguration(req.params.configuration)
     const host = `${req.protocol}://${req.headers.host}`;
     const configValues = { ...config, host };
-    const landingHTML = landingTemplate(addonInterface.manifest, configValues)
+    const landingHTML = await landingTemplate(addonInterface.manifest, configValues)
     res.setHeader('content-type', 'text/html')
     res.end(landingHTML)
 })
